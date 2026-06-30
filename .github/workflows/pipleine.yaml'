@@ -1,29 +1,147 @@
+name: moriarty_runner CI
+
+# Webhook -> Jenkins replacement: this triggers on every push/PR like a webhook would
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  APP_DIR: spring-boot-app          # change if your pom.xml lives elsewhere
+  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
 jobs:
-  build-test-sonar:
-    runs-on: self-hosted   # was: ubuntu-latest
-    defaults:
-      run:
-        working-directory: spring-boot-app
-
+  build:
+    name: Maven Build
+    runs-on: self-hosted
+    outputs:
+      build_status: ${{ steps.maven_build.outcome }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Maven build (compile + package, skip tests here)
+        id: maven_build
+        working-directory: ${{ env.APP_DIR }}
+        run: mvn -B clean package -DskipTests
+
+      - name: Upload build artifact for downstream jobs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target
+          path: ${{ env.APP_DIR }}/target
+          retention-days: 1
+
+      - name: Report Maven failure
+        if: failure()
+        run: echo "Maven stage FAILED" >> "$GITHUB_STEP_SUMMARY"
+
+  sonarqube:
+    name: SonarQube Analysis
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SonarQube needs full git history for blame/new-code analysis
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: target
+          path: ${{ env.APP_DIR }}/target
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+
+      - name: Run SonarQube analysis
+        id: sonar_scan
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          mvn -B sonar:sonar \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.timeout=300
+
+      - name: Report SonarQube failure (quality gate "No")
+        if: failure()
+        run: echo "SonarQube quality gate FAILED" >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: Tests
+    needs: sonarqube
+    runs-on: self-hosted
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
           java-version: '17'
           cache: maven
 
       - name: Run unit tests
+        id: run_tests
+        working-directory: ${{ env.APP_DIR }}
         run: mvn -B test
 
-      - name: SonarQube analysis
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-        run: mvn -B sonar:sonar -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.token=$SONAR_TOKEN
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: ${{ env.APP_DIR }}/target/surefire-reports
+          retention-days: 5
 
-      - name: Package JAR
-        run: mvn -B package -DskipTests
+  notify-on-failure:
+    name: Report (Slack + Email)
+    needs: [ build, sonarqube, tests ]
+    if: failure()
+    runs-on: self-hosted
+    steps:
+      - name: Slack notification
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: ":x: moriarty_runner pipeline failed on `${{ github.ref_name }}` (${{ github.sha }}). <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "moriarty_runner pipeline FAILED - ${{ github.ref_name }}"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: moriarty_runner CI
+          body: |
+            Pipeline failed on branch ${{ github.ref_name }}, commit ${{ github.sha }}.
+            Run details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
