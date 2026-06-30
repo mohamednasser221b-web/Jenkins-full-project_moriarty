@@ -81,10 +81,11 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         run: |
           mvn -B sonar:sonar \
-            -Dsonar.host.url="${SONAR_HOST_URL}" \
-            -Dsonar.token="${SONAR_TOKEN}" \
-            -Dsonar.qualitygate.wait=true \
-            -Dsonar.qualitygate.timeout=300
+           -Dsonar.projectKey=pipline_demo2 \
+           -Dsonar.host.url="${SONAR_HOST_URL}" \
+           -Dsonar.token="${SONAR_TOKEN}" \
+           -Dsonar.qualitygate.wait=true \
+           -Dsonar.qualitygate.timeout=300
 
       - name: Report SonarQube failure (quality gate "No")
         if: failure()
